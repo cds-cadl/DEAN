@@ -393,8 +393,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     api_request_start_time = datetime.now(ET)
                     response = await send_to_api_async(
                         final_prompt_to_api,
-                        number_of_responses=2,
-                        response_types=["positive", "negative"],
+                        number_of_responses=4,
+                        response_types=["positive", "negative", "positive with an additional question as a follow up", "negative with an additional question as a follow up"],
                         search_mode="naive"
                     )
                     api_request_end_time = datetime.now(ET)
@@ -409,7 +409,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     responses_dict = {
                         'Display': partner_prompt,
                         'response1': responses_list[0].get('response_text', ''),
-                        'response2': responses_list[1].get('response_text', '')
+                        'response2': responses_list[1].get('response_text', ''),
+                        'response3': responses_list[2].get('response_text', ''),
+                        'response4': responses_list[3].get('response_text', '')
                     }
 
                     if incomplete_message:
