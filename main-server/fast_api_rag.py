@@ -145,7 +145,8 @@ class GenerateResponseRequest(BaseModel):
     prompt: str = Field(..., example="What are the benefits of renewable energy?")
     number_of_responses: int = Field(..., ge=1, le=5, example=2)
     response_types: List[str] = Field(..., example=["positive", "negative"])
-    search_mode: str = Field(..., example="hybrid", description="Options: naive, local, global, hybrid")
+    search_mode: str = Field(..., example="hybrid", description="Options: naive, local, global, hybrid"),
+    topic_response: bool = Field(..., example=False,description="Whether to generate topic comment responses")
 
 class GeneratedResponse(BaseModel):
     response_type: str
@@ -196,9 +197,11 @@ async def generate_response_informed(request: GenerateResponseRequest):
         f"search_mode: {request.search_mode}"
     )
 
-    # Define the system prompt with JSON instruction and example
-    system_prompt = (
-        "As Todd, respond to the following question in a conversational manner, "
+    topic_mode = request.topic_response
+
+    if topic_mode:
+        system_prompt = (
+        "As Todd, generate responses on this topic in a conversational manner, "
         "keeping each response under 15 words for brevity and relevance. "
         "Focus on providing honest and personal answers that align with my perspective in the story. "
         "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
@@ -208,7 +211,22 @@ async def generate_response_informed(request: GenerateResponseRequest):
         "  {\"response_type\": \"positive\", \"response_text\": \"Reduces carbon emissions.\"},\n"
         "  {\"response_type\": \"negative\", \"response_text\": \"High initial costs.\"}\n"
         "]\n\n"
-    )
+        )
+    # Define the system prompt with JSON instruction and example
+    else:
+
+        system_prompt = (
+            "As Todd, respond to the following question in a conversational manner, "
+            "keeping each response under 15 words for brevity and relevance. "
+            "Focus on providing honest and personal answers that align with my perspective in the story. "
+            "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
+            "Return only the JSON without any additional text.\n\n"
+            "Example:\n"
+            "[\n"
+            "  {\"response_type\": \"positive\", \"response_text\": \"Reduces carbon emissions.\"},\n"
+            "  {\"response_type\": \"negative\", \"response_text\": \"High initial costs.\"}\n"
+            "]\n\n"
+        )
 
     # Construct the system query by combining system_prompt with the user prompt
     system_query = (

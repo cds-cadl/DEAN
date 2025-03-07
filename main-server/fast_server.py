@@ -216,12 +216,13 @@ async def get_speech_to_text():
         logger.error(f"HTTP error while fetching speech-to-text: {e}")
         return {}
 
-async def send_to_api_async(prompt, number_of_responses, response_types, search_mode):
+async def send_to_api_async(prompt, number_of_responses, response_types, search_mode, generate_topic_response):
     payload = {
         'prompt': prompt,
         'number_of_responses': number_of_responses,
         'response_types': response_types,
-        'search_mode': search_mode
+        'search_mode': search_mode,
+        'topic_response': generate_topic_response
     }
     logger.info(f"Sending payload to API with prompt:\n{prompt}")
     try:
@@ -394,8 +395,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     response = await send_to_api_async(
                         final_prompt_to_api,
                         number_of_responses=4,
-                        response_types=["positive", "negative", "positive with an additional question as a follow up", "negative with an additional question as a follow up"],
-                        search_mode="naive"
+                        response_types=["positive", "negative", "a positive answer to the partner question along with an additional question as a follow up", "a negative answer to the partner question along with an additional question as a follow up"],
+                        search_mode="naive",
+                        generate_topic_response=False
                     )
                     api_request_end_time = datetime.now(ET)
                     api_latency = (api_request_end_time - api_request_start_time).total_seconds()
@@ -481,6 +483,62 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.error("No chosen response found in the received data.")
                         await websocket.send_text(json.dumps({'error': 'Chosen response is empty.'}))
                         websocket_message_sent("/ws")
+
+                elif prefix == 'Generate Topic Comment':
+                    
+                    topic_comment = state.get("$socket", "")
+
+                    # Add conversation history to the prompt for context
+                    history_context = format_conversation_history_for_prompt(conversation_history)
+                    final_prompt_to_api = f"{history_context}\nTopic: {topic_comment}\n\nPlease respond accordingly."
+                    # Store it globally so we can use it later when chosen response is picked
+                    last_full_prompt_to_api = final_prompt_to_api
+
+                    # Send prompt to LightRAG API
+                    api_request_start_time = datetime.now(ET)
+                    response = await send_to_api_async(
+                        final_prompt_to_api,
+                        number_of_responses=4,
+                        response_types=["positive", "negative", "a positive response on the given topic along with an additional question as a follow up", "a negative response on the given topic along with an additional question as a follow up"],
+                        search_mode="naive",
+                        generate_topic_response=True
+                    )
+                    api_request_end_time = datetime.now(ET)
+                    api_latency = (api_request_end_time - api_request_start_time).total_seconds()
+
+                    responses_list = response.get('responses', [])
+                    # Ensure at least 2 responses
+                    while len(responses_list) < 2:
+                        responses_list.append({'response_text': 'No response available.'})
+
+                    # Construct response dictionary
+                    responses_dict = {
+                        'Display': partner_prompt,
+                        'response1': responses_list[0].get('response_text', ''),
+                        'response2': responses_list[1].get('response_text', ''),
+                        'response3': responses_list[2].get('response_text', ''),
+                        'response4': responses_list[3].get('response_text', '')
+                    }
+
+                    if incomplete_message:
+                        responses_dict['warning'] = incomplete_message
+
+                    time_responses_sent = datetime.now(ET)
+                    await websocket.send_text(json.dumps(responses_dict))
+                    websocket_message_sent("/ws")
+
+                    # Update conversation histories with partner prompt and no chosen response yet
+                    update_history(
+                        conversation_history,
+                        partner_prompt,
+                        None,
+                        responses_list,
+                        full_conversation_history,
+                        emotion,
+                        server_to_pi_latency,
+                        pi_to_server_latency,
+                        api_latency
+                    )
 
                 elif prefix == 'new_conv':
                     logger.info("Received 'new_conv' prefix, starting a new conversation.")
