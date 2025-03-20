@@ -394,8 +394,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     api_request_start_time = datetime.now(ET)
                     response = await send_to_api_async(
                         final_prompt_to_api,
-                        number_of_responses=4,
-                        response_types=["positive", "negative", "a positive answer to the partner question along with an additional question as a follow up", "a negative answer to the partner question along with an additional question as a follow up"],
+                        number_of_responses=8,
+                        response_types=["positive", 
+                                        "negative", 
+                                        "positive with more variation in response", 
+                                        "negative with more variation in response",
+                                        "a follow-up question with positive intent",
+                                        "a follow-up question with negative intent",
+                                        "a follow-up question with positive intent and more response variation",
+                                        "a follow-up question with positive intent and more response variation"],
                         search_mode="naive",
                         generate_topic_response=False
                     )
@@ -413,7 +420,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         'response1': responses_list[0].get('response_text', ''),
                         'response2': responses_list[1].get('response_text', ''),
                         'response3': responses_list[2].get('response_text', ''),
-                        'response4': responses_list[3].get('response_text', '')
+                        'response4': responses_list[3].get('response_text', ''),
+                        'turnaround1': responses_list[4].get('response_text', ''),
+                        'turnaround2': responses_list[5].get('response_text', ''),
+                        'turnaround3': responses_list[6].get('response_text', ''),
+                        'turnaround4': responses_list[7].get('response_text', '')
                     }
 
                     if incomplete_message:
@@ -443,7 +454,43 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     if chosen_response:
                         logger.info(f"Received chosen response: {chosen_response}")
-                        if conversation_history and conversation_history[-1]['user_response'] is None:
+
+                        if conversation_history and conversation_history[-1]['user_response'] is not None: #turnaround
+                            # Update the last conversation pair with user's chosen response
+                            answer = conversation_history[-1]['user_response']
+                            question = chosen_response
+                            conversation_history[-1]['user_response'] = " ".join([answer,question])
+                            update_full_history(full_conversation_history, conversation_history[-1], chosen_response)
+                            timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+
+                            if not full_conversation_history:
+                                logger.error("Full conversation history is empty. Cannot append to CSV.")
+                                await websocket.send_text(json.dumps({'error': 'Conversation history is empty.'}))
+                                websocket_message_sent("/ws")
+                                continue
+
+                            latest_full_entry = full_conversation_history[-1]
+
+                            # Format history and responses for CSV
+                            formatted_history = format_history_for_csv(latest_full_entry.get('history_snapshot', []))
+                            formatted_responses = format_responses_for_csv(latest_full_entry.get('responses', []))
+
+                            csv_entry = {
+                                'index': len(conversation_history),
+                                'date_time': timestamp,
+                                'prompt': conversation_history[-1]['prompt'],  # Partner prompt
+                                'history': formatted_history,
+                                'responses': formatted_responses,
+                                'chosen_response': chosen_response,
+                                'server_to_pi_latency': conversation_history[-1]['server_to_pi_latency'],
+                                'pi_to_server_latency': conversation_history[-1]['pi_to_server_latency'],
+                                'api_latency': conversation_history[-1]['api_latency'],
+                                'chosen_response_latency': chosen_response_latency,
+                                'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else ""
+                            }
+                            append_to_csv_file(csv_file_path, csv_entry)
+
+                        elif conversation_history and conversation_history[-1]['user_response'] is None:
                             # Update the last conversation pair with user's chosen response
                             conversation_history[-1]['user_response'] = chosen_response
                             update_full_history(full_conversation_history, conversation_history[-1], chosen_response)
