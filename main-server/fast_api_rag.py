@@ -143,7 +143,7 @@ async def aquery(query: str, param: QueryParam):
 # -------------------------
 class GenerateResponseRequest(BaseModel):
     prompt: str = Field(..., example="What are the benefits of renewable energy?")
-    number_of_responses: int = Field(..., ge=1, le=5, example=2)
+    number_of_responses: int = Field(..., ge=1, le=10, example=2)
     response_types: List[str] = Field(..., example=["positive", "negative"])
     search_mode: str = Field(..., example="hybrid", description="Options: naive, local, global, hybrid"),
     topic_response: bool = Field(..., example=False,description="Whether to generate topic comment responses")
