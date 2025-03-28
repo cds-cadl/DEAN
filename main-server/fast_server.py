@@ -545,8 +545,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     api_request_start_time = datetime.now(ET)
                     response = await send_to_api_async(
                         final_prompt_to_api,
-                        number_of_responses=4,
-                        response_types=["positive", "negative", "a positive response on the given topic along with an additional question as a follow up", "a negative response on the given topic along with an additional question as a follow up"],
+                        number_of_responses=8,
+                        response_types=["a positive response on the given topic", 
+                                        "a negative response on the given topic", 
+                                        "a positive response on the given topic with more variation", 
+                                        "a negative response on the given topic with more variation",
+                                        "a follow-up question with positive intent on the given topic",
+                                        "a follow-up question with negative intent on the given topic",
+                                        "a follow-up question with positive intent and more response variation on the given topic",
+                                        "a follow-up question with positive intent and more response variation on the given topic"],
                         search_mode="naive",
                         generate_topic_response=True
                     )
@@ -564,7 +571,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         'response1': responses_list[0].get('response_text', ''),
                         'response2': responses_list[1].get('response_text', ''),
                         'response3': responses_list[2].get('response_text', ''),
-                        'response4': responses_list[3].get('response_text', '')
+                        'response4': responses_list[3].get('response_text', ''),
+                        'turnaround1': responses_list[4].get('response_text', ''),
+                        'turnaround2': responses_list[5].get('response_text', ''),
+                        'turnaround3': responses_list[6].get('response_text', ''),
+                        'turnaround4': responses_list[7].get('response_text', '')
                     }
 
                     if incomplete_message:
