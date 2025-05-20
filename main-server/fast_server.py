@@ -144,7 +144,7 @@ def csv_entry_appended():
 
 client = httpx.AsyncClient()
 api_url = "http://localhost:7000/generate_response_informed"  # Ensure this points to the API server's internal IP if on GCP
-rasp_pi_api_url = "https://humane-marmot-entirely.ngrok-free.app"
+rasp_pi_api_url = "https://usable-brightly-raven.ngrok-free.app" #"https://humane-marmot-entirely.ngrok-free.app"
 headers = {"Content-Type": "application/json"}
 
 # ------------------------ CSV Configuration ------------------------
@@ -263,7 +263,7 @@ def format_conversation_history_for_prompt(conversation_history):
             history_str += f"User: {h['user_response']}\n"
     return history_str.strip()
 
-def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency, pi_to_server_latency, api_latency):
+def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency=0, pi_to_server_latency=0, api_latency=0):
     if len(history) >= 3:
         removed = history.pop(0)
         logger.debug(f"Removed oldest entry from conversation history: {removed['prompt']}")
@@ -326,6 +326,7 @@ async def websocket_endpoint(websocket: WebSocket):
     time_responses_sent = None
     last_full_prompt_to_api = None
     initialize_csv_file(csv_file_path)
+    partner_prompt = ""
 
     # Accept the WebSocket connection
     await websocket.accept()
@@ -540,6 +541,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     final_prompt_to_api = f"{history_context}\nTopic: {topic_comment}\n\nPlease respond accordingly."
                     # Store it globally so we can use it later when chosen response is picked
                     last_full_prompt_to_api = final_prompt_to_api
+                    incomplete_message = check_last_entry(conversation_history)
 
                     # Send prompt to LightRAG API
                     api_request_start_time = datetime.now(ET)
@@ -564,6 +566,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Ensure at least 2 responses
                     while len(responses_list) < 2:
                         responses_list.append({'response_text': 'No response available.'})
+
+                    # if not partner_prompt: # first utterance by the user
+                    #     partner_prompt = ""
 
                     # Construct response dictionary
                     responses_dict = {
@@ -593,8 +598,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         responses_list,
                         full_conversation_history,
                         emotion,
-                        server_to_pi_latency,
-                        pi_to_server_latency,
                         api_latency
                     )
 
