@@ -157,9 +157,8 @@ os.makedirs(session_csv_dir, exist_ok=True)
 
 # Updated CSV headers to include the full prompt sent to the API
 CSV_HEADERS = [
-    'index', 'date_time', 'prompt', 'history', 'responses',
-    'chosen_response', 'server_to_pi_latency',
-    'pi_to_server_latency', 'api_latency', 'chosen_response_latency', 'full_prompt_to_api'
+    'index', 'date_time', 'prompt', 'prompt_for_response', 'history', 'responses',
+    'chosen_response', 'api_latency', 'chosen_response_latency', 'full_prompt_to_api'
 ]
 
 # ------------------------ In-Memory Conversation Histories ------------------------
@@ -266,7 +265,7 @@ def format_conversation_history_for_prompt(conversation_history):
             history_str += f"User: {h['user_response']}\n"
     return history_str.strip()
 
-def update_history(history, partner_prompt, user_response, model_responses, full_history, emotion, server_to_pi_latency=0, pi_to_server_latency=0, api_latency=0):
+def update_history(history, partner_prompt, user_response, model_responses, full_history, prompt_for_response, emotion, api_latency=0):
     if len(history) >= 3:
         removed = history.pop(0)
         logger.debug(f"Removed oldest entry from conversation history: {removed['prompt']}")
@@ -274,8 +273,7 @@ def update_history(history, partner_prompt, user_response, model_responses, full
     history.append({
         'prompt': partner_prompt,
         'user_response': user_response,
-        'server_to_pi_latency': server_to_pi_latency,
-        'pi_to_server_latency': pi_to_server_latency,
+        'prompt_for_response': prompt_for_response,
         'api_latency': api_latency
     })
 
@@ -321,11 +319,12 @@ def get_transcript(data):
     is_final   = data.get("isFinal")
     timestamp  = data.get("timestamp")
 
-    return (transcript,is_final)
+    return (transcript,is_final,timestamp)
 # ------------------------ WebSocket Endpoint ------------------------
 websocket = None
 queue = deque()
 response_chosen_flag = False
+time_responses_sent = None
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket_: WebSocket):
@@ -334,12 +333,13 @@ async def websocket_endpoint(websocket_: WebSocket):
     global csv_file_path, conversation_history, full_conversation_history, time_responses_sent
     global last_full_prompt_to_api
     global response_chosen_flag
+    global time_responses_sent
 
     # Start a new conversation session: generate and initialize CSV
     csv_file_path = generate_csv_filename()
     conversation_history = []
     full_conversation_history = []
-    time_responses_sent = None
+    # time_responses_sent = None
     last_full_prompt_to_api = None
     initialize_csv_file(csv_file_path)
     partner_prompt = ""
@@ -373,7 +373,7 @@ async def websocket_endpoint(websocket_: WebSocket):
                         logger.info(f"Received chosen response: {chosen_response}")
                         if queue:
                             entire_partner_prompt = ' '.join(queue)
-                            conversation_history[-1]['prompt'] = conversation_history[-1]['prompt'] + entire_partner_prompt
+                            conversation_history[-1]['prompt'] = entire_partner_prompt
                             queue.clear()
 
                         if conversation_history and conversation_history[-1]['user_response'] is not None: #turnaround
@@ -401,11 +401,10 @@ async def websocket_endpoint(websocket_: WebSocket):
                                 'index': len(conversation_history),
                                 'date_time': timestamp,
                                 'prompt': conversation_history[-1]['prompt'],  # Partner prompt
+                                'prompt_for_response': conversation_history[-1]['prompt_for_response'],
                                 'history': formatted_history,
                                 'responses': formatted_responses,
                                 'chosen_response': chosen_response,
-                                'server_to_pi_latency': conversation_history[-1]['server_to_pi_latency'],
-                                'pi_to_server_latency': conversation_history[-1]['pi_to_server_latency'],
                                 'api_latency': conversation_history[-1]['api_latency'],
                                 'chosen_response_latency': chosen_response_latency,
                                 'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else ""
@@ -434,11 +433,10 @@ async def websocket_endpoint(websocket_: WebSocket):
                                 'index': len(conversation_history),
                                 'date_time': timestamp,
                                 'prompt': conversation_history[-1]['prompt'],  # Partner prompt
+                                'prompt_for_response': conversation_history[-1]['prompt_for_response'],
                                 'history': formatted_history,
                                 'responses': formatted_responses,
                                 'chosen_response': chosen_response,
-                                'server_to_pi_latency': conversation_history[-1]['server_to_pi_latency'],
-                                'pi_to_server_latency': conversation_history[-1]['pi_to_server_latency'],
                                 'api_latency': conversation_history[-1]['api_latency'],
                                 'chosen_response_latency': chosen_response_latency,
                                 'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else ""
@@ -581,6 +579,12 @@ async def metrics_endpoint():
 async def receive_transcript_proxy_temp(request: Request):
     global queue
     global response_chosen_flag
+    global last_full_prompt_to_api
+    global time_responses_sent
+    global conversation_history
+
+    api_latency=None
+    # receive_transcript_request_time = datetime.now() #time when the server recieved a request from OS-DPI for transcription
 
     if request.method == "OPTIONS":
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -597,18 +601,23 @@ async def receive_transcript_proxy_temp(request: Request):
 
                 if not queue:
                     response_chosen_flag = False
-                    emotion = 'cheerful'
-                    server_to_pi_latency = 0
-                    pi_to_server_latency = 0
-                    api_latency=0
-                    partner_prompt,is_final_transcript = get_transcript(data)
-                    print("INSIDE transcript API")
-                    logger.info(f"Partner prompt received: {partner_prompt}")
-                    await websocket.send_text(json.dumps({'state': {"$Display": partner_prompt}}))
-                    websocket_message_sent("/ws")
+                    emotion = 'friendly'
+                    partner_prompt,is_final_transcript,time_dG_received = get_transcript(data)
 
                     if is_final_transcript:
+                        # transcribed_time = datetime.now() #time when server recieved the final transcribed speech from OS-DPI asr.js 
+                        # time_dG_received = datetime.fromtimestamp(time_dG_received / 1000.0) #to convert JS date format to Python date format
+                        # latency_server_to_OS_DPI_transcription_receive_time = (transcribed_time - receive_transcript_request_time).total_seconds()
+                        # latency_OS_DPI_sent_to_server_receive_time = (transcribed_time - time_dG_received).total_seconds()
+
+                        # logger.info(f"latency_server_receive_to_transcribe_time: {latency_server_to_OS_DPI_transcription_receive_time}")
+                        # logger.info(f"latency_OS_DPI_sent_to_server_receive: {latency_OS_DPI_sent_to_server_receive_time}")
+
+                        logger.info(f"Partner prompt received: {partner_prompt}")
+
                         queue.append(partner_prompt)
+                        prompt_for_response = partner_prompt #to capture which partner prompt is used for generating responses in that conversation turn
+                        
                         # Add conversation history to the prompt for context
                         history_context = format_conversation_history_for_prompt(conversation_history)
                         final_prompt_to_api = f"{history_context}\nPartner: {partner_prompt}\n\nPlease respond accordingly."
@@ -666,16 +675,22 @@ async def receive_transcript_proxy_temp(request: Request):
                             None,
                             responses_list,
                             full_conversation_history,
+                            prompt_for_response,
                             emotion,
-                            server_to_pi_latency,
-                            pi_to_server_latency,
                             api_latency
                         )
                 else:
                     if response_chosen_flag == False:
-                        partner_prompt,is_final_transcript = get_transcript(data)
+                        partner_prompt,is_final_transcript,time_dG_received = get_transcript(data)
                         if is_final_transcript:
                             queue.append(partner_prompt)
+                            # transcribed_time = datetime.now() #time when server recieved the transcribed speech from OS-DPI asr.js 
+                            # time_dG_received = datetime.fromtimestamp(time_dG_received / 1000.0) #to convert JS date format to Python date format
+                            # latency_server_to_OS_DPI_transcription_receive_time = (transcribed_time - receive_transcript_request_time).total_seconds()
+                            # latency_OS_DPI_sent_to_server_receive_time = (transcribed_time - time_dG_received).total_seconds()
+                            # logger.info(f"latency_server_receive_to_transcribe_time: {latency_server_to_OS_DPI_transcription_receive_time}")
+                            # logger.info(f"latency_OS_DPI_sent_to_server_receive: {latency_OS_DPI_sent_to_server_receive_time}")
+                            logger.info(f"Partner prompt received: {partner_prompt}")
 
             elif source == "prompt":
                 rows = data.get("rows", [])
