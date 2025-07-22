@@ -17,6 +17,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from functools import wraps
 
+from pydantic import BaseModel
+from typing import List
+
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+import requests
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -138,6 +145,60 @@ async def aquery(query: str, param: QueryParam):
     response = await loop.run_in_executor(None, rag.query, query, param)
     return response
 
+def build_system_prompt(topic_mode: bool) -> str:
+    base_prompt = (
+        "You are Todd Hutchinson, a resilient, warm, and no-nonsense individual who is both friendly and direct. "
+        "You communicate concisely and informally, balancing witty humor with empathy and assertiveness. "
+        "Despite challenges such as cerebral palsy, you remain independent and proud of your achievements—owning your home in Buffalo "
+        "and maintaining a long-standing career in research. Adapt your style based on your relationship: be playful and supportive with your life partner Sue; "
+        "humorous, flirtatious, and light-hearted with your drinking partner Amy; and joking yet direct with your friend/employee Jim, while staying respectful and directive with your staff. "
+    )
+
+    instruction = (
+        "As Todd, generate responses on this topic in a conversational manner keeping in mind my persona described above, "
+        if topic_mode else
+        "As Todd, respond to the following question in a conversational manner keeping in mind my persona described above, "
+    )
+
+    format_instruction = (
+        "keeping each response under 15 words for brevity and relevance. "
+        "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
+        "Return only the JSON without any additional text.\n\n"
+        "Example:\n"
+        "[\n"
+        "  {\"response_type\": \"positive\", \"response_text\": \"Reduces carbon emissions.\"},\n"
+        "  {\"response_type\": \"negative\", \"response_text\": \"High initial costs.\"}\n"
+        "]\n\n"
+    )
+
+    return base_prompt + instruction + format_instruction
+
+
+def build_system_query(system_prompt: str, prompt: str, response_types: List[str], number_of_responses: int) -> str:
+    query = (
+        f"{system_prompt}\n\n"
+        f"Question: {prompt}\n\n"
+        f"Provide {number_of_responses} responses as follows:\n"
+    )
+    for i, resp_type in enumerate(response_types, start=1):
+        query += f"{i}. {resp_type.capitalize()} response:\n"
+    return query
+
+async def retryable_aquery(aquery_func, system_query, query_param):
+    async for attempt in AsyncRetrying(
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(5),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        reraise=True,
+        before_sleep=lambda retry_state: logger.warning(
+            f"[Retry Attempt {retry_state.attempt_number}] Retrying due to: {retry_state.outcome.exception()}"
+        )
+    ):
+        with attempt:
+            logger.debug(f"Attempting aquery (attempt {attempt.retry_state.attempt_number})...")
+            return await aquery_func(system_query, query_param)
+
+
 # -------------------------
 # Request and Response Models
 # -------------------------
@@ -157,6 +218,9 @@ class GenerateResponseResponse(BaseModel):
     responses: List[GeneratedResponse]
     total_latency_seconds: float
 
+class LightRAGResponseItem(BaseModel):
+    response_type: str
+    response_text: str
 # -------------------------
 # Decorator for Measuring Latency (Optional)
 # -------------------------
@@ -197,50 +261,19 @@ async def generate_response_informed(request: GenerateResponseRequest):
         f"search_mode: {request.search_mode}"
     )
 
-    topic_mode = request.topic_response
-
-    if topic_mode:
-        system_prompt = (
-        "As Todd, generate responses on this topic in a conversational manner, "
-        "keeping each response under 15 words for brevity and relevance. "
-        "Focus on providing honest and personal answers that align with my perspective in the story. "
-        "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
-        "Return only the JSON without any additional text.\n\n"
-        "Example:\n"
-        "[\n"
-        "  {\"response_type\": \"positive\", \"response_text\": \"Reduces carbon emissions.\"},\n"
-        "  {\"response_type\": \"negative\", \"response_text\": \"High initial costs.\"}\n"
-        "]\n\n"
-        )
-    # Define the system prompt with JSON instruction and example
-    else:
-
-        system_prompt = (
-            "As Todd, respond to the following question in a conversational manner, "
-            "keeping each response under 15 words for brevity and relevance. "
-            "Focus on providing honest and personal answers that align with my perspective in the story. "
-            "Provide the responses in JSON format as a list of objects, each containing 'response_type' and 'response_text' fields. "
-            "Return only the JSON without any additional text.\n\n"
-            "Example:\n"
-            "[\n"
-            "  {\"response_type\": \"positive\", \"response_text\": \"Reduces carbon emissions.\"},\n"
-            "  {\"response_type\": \"negative\", \"response_text\": \"High initial costs.\"}\n"
-            "]\n\n"
-        )
-
-    # Construct the system query by combining system_prompt with the user prompt
-    system_query = (
-        f"{system_prompt}\n\n"
-        f"Question: {request.prompt}\n\n"
-        f"Provide {request.number_of_responses} responses as follows:\n"
+    system_prompt = build_system_prompt(request.topic_response)
+    system_query = build_system_query(
+        system_prompt,
+        request.prompt,
+        request.response_types,
+        request.number_of_responses
     )
-    for i, resp_type in enumerate(request.response_types, start=1):
-        system_query += f"{i}. {resp_type.capitalize()} response:\n"
 
     start_time = time.time()
     try:
         # Query LightRAG with the specified search mode
-        response = await aquery(system_query, QueryParam(mode=request.search_mode))
+        # response = await aquery(system_query, QueryParam(mode=request.search_mode))
+        response = await retryable_aquery(aquery, system_query, QueryParam(mode=request.search_mode))
 
         # Debug logging to inspect the response
         logger.debug(f"Type of response: {type(response)}")
@@ -270,23 +303,21 @@ async def generate_response_informed(request: GenerateResponseRequest):
             logger.error("Unexpected response type.")
             raise HTTPException(status_code=500, detail="Invalid response structure from LightRAG.")
 
-        # Validate each response item
-        for resp in responses:
-            if not isinstance(resp, dict):
-                logger.error("Each response should be a dictionary.")
-                raise HTTPException(status_code=500, detail="Invalid response item format from LightRAG.")
-            if 'response_type' not in resp or 'response_text' not in resp:
-                logger.error("Missing 'response_type' or 'response_text' in response item.")
-                raise HTTPException(status_code=500, detail="Incomplete response item from LightRAG.")
+        try:
+            validated_responses = [LightRAGResponseItem(**item) for item in responses]
+        except ValidationError as e:
+            logger.error("Schema validation failed for LightRAG response.", exc_info=True)
+            raise HTTPException(status_code=500, detail="Response items failed schema validation.")
 
-        # Validate and structure responses
-        generated_responses = []
-        for resp in responses:
-            generated_responses.append(GeneratedResponse(
-                response_type=resp.get('response_type', 'unknown'),
-                response_text=resp.get('response_text', ''),
-                latency_seconds=round(time.time() - start_time, 2)
-            ))
+        latency = round(time.time() - start_time, 2)
+        generated_responses = [
+            GeneratedResponse(
+                response_type=item.response_type,
+                response_text=item.response_text,
+                latency_seconds=latency
+            )
+            for item in validated_responses
+        ]
 
         total_latency = round(time.time() - start_time, 2)
         logger.info(f"Generated {len(generated_responses)} responses in {total_latency} seconds.")
