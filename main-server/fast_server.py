@@ -219,6 +219,7 @@ async def get_speech_to_text():
         return {}
 
 async def send_to_api_async(prompt, number_of_responses, response_types, search_mode, generate_topic_response):
+
     payload = {
         'prompt': prompt,
         'number_of_responses': number_of_responses,
@@ -227,18 +228,38 @@ async def send_to_api_async(prompt, number_of_responses, response_types, search_
         'topic_response': generate_topic_response
     }
     logger.info(f"Sending payload to API with prompt:\n{prompt}")
+
+
+    # Custom timeout configuration
+    timeout = httpx.Timeout(
+        connect=5.0,  # Max time to establish connection
+        read=10.0,    # Max time to wait for response data
+        write=5.0,    # Max time to send request data
+        pool=5.0      # Max time to wait for a connection from the pool
+    )
+
     try:
-        response = await client.post(api_url, headers=headers, json=payload, timeout=30)
+        response = await client.post(api_url, headers=headers, json=payload, timeout=timeout)
         response.raise_for_status()
         response_json = response.json()
         logger.info(f"Received response from API: {response_json}")
-        return response_json
+        return (response_json,True,None)
+    
+    except httpx.ReadTimeout as e:
+        logger.error("Request timed out.")
+        return ({"responses": []}, False, "Request timed out. Please try again.")
+
+    except httpx.ConnectTimeout as e:
+        logger.error("Connection timed out.")
+        return ({"responses": []}, False, "Connection timed out. Please try again.")
+
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
-        return {"responses": []}
+        logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
+        return ({"responses": []}, False, e.response.text)
+
     except httpx.RequestError as e:
-        logger.error(f"Error sending request to API: {e}")
-        return {"responses": []}
+        logger.error(f"Request error: {e}")
+        return ({"responses": []}, False, str(e))
 
 def check_last_entry(history):
     if history and history[-1]['user_response'] is None:
@@ -299,7 +320,7 @@ def update_history(history, partner_prompt, user_response, model_responses, full
 
 def update_full_history(full_history, last_convo_pair, chosen_response):
     for entry in reversed(full_history):
-        # if entry['prompt'] == last_convo_pair['prompt'] and entry['user_response'] is None:
+        #if entry['prompt'] == last_convo_pair['prompt'] and entry['user_response'] is None:
         if entry['user_response'] is None:
             entry['user_response'] = chosen_response
             break
@@ -331,6 +352,10 @@ def get_transcript(data):
     timestamp  = data.get("timestamp")
 
     return (transcript,is_final,timestamp)
+
+def fallback_response(message="Sorry, no response available due to an internal error."):
+    return [{'response_text': message} for _ in range(8)]
+
 # ------------------------ WebSocket Endpoint ------------------------
 websocket = None
 queue = deque()
@@ -388,6 +413,8 @@ async def websocket_endpoint(websocket_: WebSocket):
                             input_type_flag = '[DIRECT SELECTION]'
                         elif input_type == 'Generated':
                             input_type_flag = '[GENERATED]'
+                        elif input_type == 'Topic Comment':
+                            input_type_flag = '[TOPIC COMMENT GENERATION]'
 
                     time_chosen_response_received = datetime.now(ET)
                     chosen_response_latency = (time_chosen_response_received - time_responses_sent).total_seconds() if time_responses_sent else 0.0
@@ -544,28 +571,35 @@ async def websocket_endpoint(websocket_: WebSocket):
                     last_full_prompt_to_api = final_prompt_to_api
                     incomplete_message = check_last_entry(conversation_history)
 
-                    # Send prompt to LightRAG API
-                    api_request_start_time = datetime.now(ET)
-                    response = await send_to_api_async(
-                        final_prompt_to_api,
-                        number_of_responses=8,
-                        response_types=["a positive response on the given topic", 
-                                        "a negative response on the given topic", 
-                                        "a positive response on the given topic with more variation", 
-                                        "a negative response on the given topic with more variation",
-                                        "a follow-up question with positive intent on the given topic",
-                                        "a follow-up question with negative intent on the given topic",
-                                        "a follow-up question with positive intent and more response variation on the given topic",
-                                        "a follow-up question with positive intent and more response variation on the given topic"],
-                        search_mode="naive",
-                        generate_topic_response=True
-                    )
-                    api_request_end_time = datetime.now(ET)
-                    api_latency = (api_request_end_time - api_request_start_time).total_seconds()
+                    try:    
+                        # Send prompt to LightRAG API
+                        api_request_start_time = datetime.now(ET)
+                        response,is_responseOk,error_text = await send_to_api_async(
+                            final_prompt_to_api,
+                            number_of_responses=8,
+                            response_types=["a positive response on the given topic", 
+                                            "a negative response on the given topic", 
+                                            "a positive response on the given topic with more variation", 
+                                            "a negative response on the given topic with more variation",
+                                            "a follow-up question with positive intent on the given topic",
+                                            "a follow-up question with negative intent on the given topic",
+                                            "a follow-up question with positive intent and more response variation on the given topic",
+                                            "a follow-up question with positive intent and more response variation on the given topic"],
+                            search_mode="naive",
+                            generate_topic_response=True
+                        )
+                        api_request_end_time = datetime.now(ET)
+                        api_latency = (api_request_end_time - api_request_start_time).total_seconds()
 
-                    responses_list = response.get('responses', [])
-                    # Ensure at least 2 responses
-                    while len(responses_list) < 2:
+                        responses_list = response.get('responses', [])
+                    except Exception as e: # adds an extra check to ensure errors apart from httpx errors (low level errors) are handled properly and there is a fall-back for such unexpected situations
+                        logger.error(f"API call failed: {e}", exc_info=True)
+                        is_responseOk = False
+                        error_text = str(e)
+                        responses_list = fallback_response()
+
+                    # Ensure at least 8 responses
+                    while len(responses_list) < 8:
                         responses_list.append({'response_text': 'No response available.'})
 
                     # if not partner_prompt: # first utterance by the user
@@ -584,8 +618,11 @@ async def websocket_endpoint(websocket_: WebSocket):
                         'turnaround4': responses_list[7].get('response_text', '')
                     }
 
-                    if incomplete_message:
-                        responses_dict['warning'] = incomplete_message
+                    # if incomplete_message:
+                    #     responses_dict['warning'] = incomplete_message
+
+                    if not is_responseOk:
+                        responses_dict['error'] = error_text
 
                     time_responses_sent = datetime.now(ET)
                     await websocket.send_text(json.dumps(responses_dict))
@@ -607,6 +644,7 @@ async def websocket_endpoint(websocket_: WebSocket):
                     conversation_history.clear()
                     full_conversation_history.clear()
                     last_full_prompt_to_api = None
+                    queue.clear()
 
                     # Reinitialize CSV file for a new conversation session
                     csv_file_path = generate_csv_filename()
@@ -706,28 +744,36 @@ async def receive_transcript_proxy_temp(request: Request):
                         # Store it globally so we can use it later when chosen response is picked
                         last_full_prompt_to_api = final_prompt_to_api
 
-                        # Send prompt to LightRAG API
-                        api_request_start_time = datetime.now(ET)
-                        response = await send_to_api_async(
-                            final_prompt_to_api,
-                            number_of_responses=8,
-                            response_types=["positive", 
-                                            "negative", 
-                                            "positive with more variation in response", 
-                                            "negative with more variation in response",
-                                            "a follow-up question with positive intent",
-                                            "a follow-up question with negative intent",
-                                            "a follow-up question with positive intent and more response variation",
-                                            "a follow-up question with positive intent and more response variation"],
-                            search_mode="naive",
-                            generate_topic_response=False
-                        )
-                        api_request_end_time = datetime.now(ET)
-                        api_latency = (api_request_end_time - api_request_start_time).total_seconds()
+                        try:
+                            # Send prompt to LightRAG API
+                            api_request_start_time = datetime.now(ET)
+                            response,is_responseOk,error_text = await send_to_api_async(
+                                final_prompt_to_api,
+                                number_of_responses=8,
+                                response_types=["positive", 
+                                                "negative", 
+                                                "positive with more variation in response", 
+                                                "negative with more variation in response",
+                                                "a follow-up question with positive intent",
+                                                "a follow-up question with negative intent",
+                                                "a follow-up question with positive intent and more response variation",
+                                                "a follow-up question with positive intent and more response variation"],
+                                search_mode="naive",
+                                generate_topic_response=False
+                            )
+                            api_request_end_time = datetime.now(ET)
+                            api_latency = (api_request_end_time - api_request_start_time).total_seconds()
 
-                        responses_list = response.get('responses', [])
-                        # Ensure at least 2 responses
-                        while len(responses_list) < 2:
+                            responses_list = response.get('responses', [])
+
+                        except Exception as e: # adds an extra check to ensure errors apart from httpx errors (low level errors) are handled properly and there is a fall-back for such unexpected situations
+                            logger.error(f"API call failed: {e}", exc_info=True)
+                            is_responseOk = False
+                            error_text = str(e)
+                            responses_list = fallback_response()
+
+                        # Ensure at least 8 responses
+                        while len(responses_list) < 8:
                             responses_list.append({'response_text': 'No response available.'})
 
                         # Construct response dictionary
@@ -745,6 +791,8 @@ async def receive_transcript_proxy_temp(request: Request):
 
                         #if incomplete_message:
                         #    responses_dict['warning'] = incomplete_message
+                        if not is_responseOk:
+                            responses_dict['error'] = error_text
 
                         time_responses_sent = datetime.now(ET)
                         await websocket.send_text(json.dumps(responses_dict))
@@ -789,8 +837,11 @@ async def receive_transcript_proxy_temp(request: Request):
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         except Exception as e:
-            logger.error(f"An error occurred while processing the ASR process: {e}")
+            logger.error(f"An error occurred while processing the transcript: {e}")
+            await websocket.send_text(json.dumps({'error': str(e)}))
+            websocket_message_sent("/ws")
             return JSONResponse(content={"status": "error", "error": str(e)}, status_code=400)
+
 
 # ------------------------ Graceful Shutdown ------------------------
 
