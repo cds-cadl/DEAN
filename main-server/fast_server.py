@@ -14,6 +14,7 @@ import time
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from collections import deque
+from typing import Optional
 
 
 # ------------------------ Logging Configuration ------------------------
@@ -103,6 +104,9 @@ CSV_ENTRIES_APPENDED = Counter(
 class MetricsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         endpoint = request.url.path
+        if endpoint == '/metrics':
+            return await call_next(request)
+        
         method = request.method
         REQUEST_COUNT.labels(endpoint=endpoint, method=method).inc()
         
@@ -147,7 +151,6 @@ def csv_entry_appended():
 
 client = httpx.AsyncClient()
 api_url = "http://localhost:7000/generate_response_informed"  # Ensure this points to the API server's internal IP if on GCP
-rasp_pi_api_url = "https://usable-brightly-raven.ngrok-free.app" #"https://humane-marmot-entirely.ngrok-free.app"
 headers = {"Content-Type": "application/json"}
 
 # ------------------------ CSV Configuration ------------------------
@@ -161,20 +164,19 @@ CSV_HEADERS = [
     'chosen_response', 'input_type', 'api_latency', 'chosen_response_latency', 'full_prompt_to_api', 'full_conversation_history'
 ]
 
-# ------------------------ In-Memory Conversation Histories ------------------------
-
-conversation_history = []       # Stores recent conversation states (up to last 3)
-full_conversation_history = []  # Stores all conversation states
-
-# Global variables
-csv_file_path = None
-time_responses_sent = None
-
-# We will store the last full prompt to the API in conversation_history or a separate variable
-last_full_prompt_to_api = None
 
 # Eastern Time zone
 ET = pytz.timezone('US/Eastern')
+
+
+# ------- Contants ------ #
+RESPONSE_TYPES = [
+    "positive", "negative",
+    "positive with more variation in response", "negative with more variation in response",
+    "a follow-up question with positive intent", "a follow-up question with negative intent",
+    "a follow-up question with positive intent and more response variation",
+    "a follow-up question with positive intent and more response variation"
+]
 
 # ------------------------ Helper Functions ------------------------
 
@@ -203,20 +205,6 @@ def append_to_csv_file(path, entry_dict):
         csv_entry_appended()
     except Exception as e:
         logger.error(f"Failed to append to CSV: {e}")
-
-async def get_speech_to_text():
-    try:
-        response = await client.get(f'{rasp_pi_api_url}/get_audio_transcription', timeout=10)
-        response.raise_for_status()
-        data_json = response.json()
-        logger.debug(f"RPi API Response: {data_json}")
-        return data_json
-    except httpx.RequestError as e:
-        logger.error(f"Error fetching speech-to-text: {e}")
-        return {}
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error while fetching speech-to-text: {e}")
-        return {}
 
 async def send_to_api_async(prompt, number_of_responses, response_types, search_mode, generate_topic_response):
 
@@ -260,6 +248,22 @@ async def send_to_api_async(prompt, number_of_responses, response_types, search_
     except httpx.RequestError as e:
         logger.error(f"Request error: {e}")
         return ({"responses": []}, False, str(e))
+
+async def get_responses_from_api(prompt: str) -> tuple[list[dict], bool, str, float]:
+    try:
+        start = datetime.now(ET)
+        response, ok, error = await send_to_api_async(
+            prompt,
+            number_of_responses=8,
+            response_types=RESPONSE_TYPES,
+            search_mode="naive",
+            generate_topic_response=False
+        )
+        latency = (datetime.now(ET) - start).total_seconds()
+        return response.get("responses", []), ok, error, latency
+    except Exception as e: # adds an extra check to ensure errors apart from httpx errors (low level errors) are handled properly and there is a fall-back for such unexpected situations
+        logger.error(f"API call failed: {e}", exc_info=True)
+        return fallback_response(), False, str(e), 0.0
 
 def check_last_entry(history):
     if history and history[-1]['user_response'] is None:
@@ -356,329 +360,234 @@ def get_transcript(data):
 def fallback_response(message="Sorry, no response available due to an internal error."):
     return [{'response_text': message} for _ in range(8)]
 
+def format_responses_for_ws(partner_prompt: str, responses: list[dict], error: str | None = None) -> dict:
+    response_dict = {
+        "Display": partner_prompt,
+        **{f"response{i+1}": responses[i].get("response_text", "") for i in range(4)},
+        **{f"turnaround{i-3}": responses[i].get("response_text", "") for i in range(4, 8)}
+    }
+    if error:
+        response_dict["error"] = error
+    return response_dict
+
+
+class SessionManager:
+    current_session: Optional["ConversationSession"] = None
+
+    @classmethod
+    def set_session(cls, session: "ConversationSession"):
+        cls.current_session = session
+
+    @classmethod
+    def get_session(cls) -> Optional["ConversationSession"]:
+        return cls.current_session
+
+class ConversationSession:
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+        self.csv_file_path = generate_csv_filename()
+        self.conversation_history = []
+        self.full_conversation_history = []
+        self.last_full_prompt_to_api = None
+        self.response_chosen_flag = False
+        self.time_responses_sent = None
+        self.queue = deque()
+        self.input_type_flag = None
+        self.partner_prompt = ""
+
+        initialize_csv_file(self.csv_file_path)
+
+    async def run(self):
+        await self.websocket.accept()
+        logger.info("WebSocket connection accepted.")
+        websocket_connect()
+
+        try:
+            while True:
+                data = await self.websocket.receive_text()
+                if data:
+                    websocket_message_received("/ws")
+                    logger.info(f"Data received from OS-DPI at {datetime.now(ET)}")
+
+                try:
+                    data_json = json.loads(data)
+                    await self.handle_message(data_json)
+                except json.JSONDecodeError:
+                    await self.send_error("Invalid JSON format.")
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    await self.send_error("Internal server error.")
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected.")
+            websocket_disconnect()
+
+    async def handle_message(self, data_json):
+        state = data_json.get("state", {})
+        prefix = state.get("$prefix", "")
+        input_type = state.get("$InputType", "")
+        emotion = state.get("$Style", "")
+
+        self.input_type_flag = self.map_input_type(input_type)
+
+        if prefix == "Chosen":
+            await self.handle_chosen_response(state)
+        elif prefix == "Generate Topic Comment":
+            await self.handle_topic_comment(state, emotion)
+        elif prefix == "new_conv":
+            await self.start_new_conversation()
+        else:
+            await self.send_error(f"Unexpected prefix value: {prefix}")
+
+    def map_input_type(self, input_type):
+        return {
+            'Typed Utterance': '[TYPED UTTERANCE]',
+            'Direct Selection': '[DIRECT SELECTION]',
+            'Generated': '[GENERATED]',
+            'Topic Comment': '[TOPIC COMMENT GENERATION]'
+        }.get(input_type, None)
+
+    async def handle_chosen_response(self, state):
+        chosen_response = state.get("$socket", "")
+        self.response_chosen_flag = True
+        time_chosen_response_received = datetime.now(ET)
+        chosen_response_latency = (time_chosen_response_received - self.time_responses_sent).total_seconds() if self.time_responses_sent else 0.0
+
+        if not chosen_response:
+            await self.send_error("Chosen response is empty.")
+            return
+
+        logger.info(f"Received chosen response: {chosen_response}")
+
+        if self.queue:
+            entire_partner_prompt = ' '.join(self.queue)
+            self.queue.clear()
+            if self.conversation_history:
+                self.conversation_history[-1]['prompt'] = entire_partner_prompt
+                self.full_conversation_history[-1]['prompt'] = entire_partner_prompt
+
+        if self.conversation_history:
+            await self.update_conversation_with_chosen_response(chosen_response, chosen_response_latency)
+        else:
+            await self.handle_initial_chosen_response(chosen_response, chosen_response_latency, state.get("$Style", ""))
+
+    async def update_conversation_with_chosen_response(self, chosen_response, latency):
+        entry = self.conversation_history[-1]
+        full_entry = self.full_conversation_history[-1]
+        timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+
+        if entry['user_response']:
+            full_response = " ".join([entry['user_response'], chosen_response])
+            entry['user_response'] = full_response
+            full_entry['user_response'] = full_response
+        else:
+            entry['user_response'] = chosen_response
+            full_entry['user_response'] = chosen_response
+
+        await self.append_csv_entry(entry, full_entry, chosen_response, latency, timestamp)
+
+    async def handle_initial_chosen_response(self, chosen_response, latency, emotion):
+        update_history(
+            self.conversation_history,
+            None,
+            chosen_response,
+            None,
+            self.full_conversation_history,
+            None,
+            emotion,
+            None
+        )
+        update_full_history(self.full_conversation_history, self.conversation_history[-1], chosen_response)
+        timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+        await self.append_csv_entry(self.conversation_history[-1], self.full_conversation_history[-1], chosen_response, latency, timestamp)
+
+    async def handle_topic_comment(self, state, emotion):
+        topic_comment = state.get("$socket", "")
+        history_context = format_conversation_history_for_prompt(self.conversation_history)
+        final_prompt_to_api = f"{history_context}\nTopic: {topic_comment}\n\nPlease respond accordingly."
+        self.last_full_prompt_to_api = final_prompt_to_api
+
+        responses_list, is_response_ok, error_text, api_latency = await get_responses_from_api(final_prompt_to_api)
+
+        while len(responses_list) < 8:
+            responses_list.append({'response_text': 'No response available.'})
+
+        responses_dict = format_responses_for_ws(self.partner_prompt, responses_list, error_text if not is_response_ok else None)
+        self.time_responses_sent = datetime.now(ET)
+
+        await self.websocket.send_text(json.dumps(responses_dict))
+        websocket_message_sent("/ws")
+        logger.info("Generated responses sent to OS-DPI")
+
+        update_history(
+            self.conversation_history,
+            self.partner_prompt,
+            None,
+            responses_list,
+            self.full_conversation_history,
+            emotion,
+            api_latency
+        )
+
+    async def start_new_conversation(self):
+        logger.info("Received 'new_conv' prefix, starting a new conversation.")
+        self.conversation_history.clear()
+        self.full_conversation_history.clear()
+        self.last_full_prompt_to_api = None
+        self.queue.clear()
+        self.csv_file_path = generate_csv_filename()
+        initialize_csv_file(self.csv_file_path)
+        self.time_responses_sent = None
+        logger.info(f"New CSV file created at {self.csv_file_path} for the new conversation.")
+        await self.websocket.send_text(json.dumps({'state': {"$Info": "New conversation started."}}))
+        websocket_message_sent("/ws")
+
+    async def append_csv_entry(self, entry, full_entry, chosen_response, latency, timestamp):
+        if not self.full_conversation_history:
+            await self.send_error("Conversation history is empty.")
+            return
+
+        formatted_history = format_history_for_csv(full_entry.get('history_snapshot', []))
+        formatted_responses = format_responses_for_csv(full_entry.get('responses', [])) if full_entry.get('responses') else None
+        entire_conversation = format_history_for_csv(self.full_conversation_history)
+
+        csv_entry = {
+            'index': len(self.conversation_history),
+            'date_time': timestamp,
+            'prompt': entry['prompt'],
+            'prompt_for_response': entry['prompt_for_response'],
+            'history': formatted_history,
+            'responses': formatted_responses,
+            'chosen_response': chosen_response,
+            'input_type': self.input_type_flag,
+            'api_latency': entry['api_latency'],
+            'chosen_response_latency': latency,
+            'full_prompt_to_api': self.last_full_prompt_to_api or "",
+            'full_conversation_history': entire_conversation
+        }
+        append_to_csv_file(self.csv_file_path, csv_entry)
+
+    async def send_error(self, message):
+        logger.error(message)
+        await self.websocket.send_text(json.dumps({'error': message}))
+        websocket_message_sent("/ws")
+
 # ------------------------ WebSocket Endpoint ------------------------
-websocket = None
-queue = deque()
-response_chosen_flag = False
-time_responses_sent = None
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket_: WebSocket):
-    global websocket
-    websocket = websocket_
-    global csv_file_path, conversation_history, full_conversation_history, time_responses_sent
-    global last_full_prompt_to_api
-    global response_chosen_flag
-    global time_responses_sent
-    global queue
-
-    # Start a new conversation session: generate and initialize CSV
-    csv_file_path = generate_csv_filename()
-    conversation_history = []
-    full_conversation_history = []
-    # time_responses_sent = None
-    last_full_prompt_to_api = None
-    initialize_csv_file(csv_file_path)
-    partner_prompt = ""
-    queue = deque()
-    input_type_flag = None
-
-    # Accept the WebSocket connection
-    await websocket.accept()
-    logger.info("WebSocket connection accepted.")
-    websocket_connect()
-    
-    try:
-        while True:
-            data = await websocket.receive_text()
-            if data:
-                websocket_message_received("/ws")
-                time_received_osdpi = datetime.now(ET)
-                logger.info(f"Data received from OS-DPI at {time_received_osdpi}")
-
-            try:
-                data_json = json.loads(data)
-                state = data_json.get("state", {})
-                input_type = state.get("$InputType","")
-                prefix = state.get("$prefix", "")
-                emotion = state.get("$Style", "")
-
-                if prefix == 'Chosen':
-                    response_chosen_flag = True
-                    chosen_response = state.get("$socket", "")
-                    if input_type:
-                        if input_type == 'Typed Utterance':
-                            input_type_flag = '[TYPED UTTERANCE]'
-                        elif input_type == 'Direct Selection':
-                            input_type_flag = '[DIRECT SELECTION]'
-                        elif input_type == 'Generated':
-                            input_type_flag = '[GENERATED]'
-                        elif input_type == 'Topic Comment':
-                            input_type_flag = '[TOPIC COMMENT GENERATION]'
-
-                    time_chosen_response_received = datetime.now(ET)
-                    chosen_response_latency = (time_chosen_response_received - time_responses_sent).total_seconds() if time_responses_sent else 0.0
-
-                    if chosen_response:
-                        logger.info(f"Received chosen response: {chosen_response}")
-                        if queue:
-                            entire_partner_prompt = ' '.join(queue)
-                            conversation_history[-1]['prompt'] = entire_partner_prompt
-                            full_conversation_history[-1]['prompt'] = entire_partner_prompt
-                            queue.clear()
-
-                        if conversation_history and conversation_history[-1]['user_response'] is not None: #turnaround
-
-                            # Update the last conversation pair with user's chosen response
-                            answer = conversation_history[-1]['user_response']
-                            question = chosen_response
-                            full_response = " ".join([answer,question])
-                            conversation_history[-1]['user_response'] = full_response
-                            full_conversation_history[-1]['user_response'] = full_response
-                            # update_full_history(full_conversation_history, conversation_history[-1], full_response)
-                            timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
-
-                            if not full_conversation_history:
-                                logger.error("Full conversation history is empty. Cannot append to CSV.")
-                                await websocket.send_text(json.dumps({'error': 'Conversation history is empty.'}))
-                                websocket_message_sent("/ws")
-                                continue
-
-                            latest_full_entry = full_conversation_history[-1]
-
-                            # Format history and responses for CSV
-                            formatted_history = format_history_for_csv(latest_full_entry.get('history_snapshot', []))
-                            formatted_responses = format_responses_for_csv(latest_full_entry.get('responses', []))
-                            entire_conversation = format_history_for_csv(full_conversation_history)
-
-                            csv_entry = {
-                                'index': len(conversation_history),
-                                'date_time': timestamp,
-                                'prompt': conversation_history[-1]['prompt'],  # Partner prompt
-                                'prompt_for_response': conversation_history[-1]['prompt_for_response'],
-                                'history': formatted_history,
-                                'responses': formatted_responses,
-                                'chosen_response': chosen_response,
-                                'input_type': input_type_flag,
-                                'api_latency': conversation_history[-1]['api_latency'],
-                                'chosen_response_latency': chosen_response_latency,
-                                'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else "",
-                                'full_conversation_history': entire_conversation
-                            }
-                            append_to_csv_file(csv_file_path, csv_entry)
-
-                        elif conversation_history and conversation_history[-1]['user_response'] is None:
-                            # Update the last conversation pair with user's chosen response
-                            conversation_history[-1]['user_response'] = chosen_response
-                            full_conversation_history[-1]['user_response'] = chosen_response
-                            # update_full_history(full_conversation_history, conversation_history[-1], chosen_response)
-                            timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
-
-                            if not full_conversation_history:
-                                logger.error("Full conversation history is empty. Cannot append to CSV.")
-                                await websocket.send_text(json.dumps({'error': 'Conversation history is empty.'}))
-                                websocket_message_sent("/ws")
-                                continue
-
-                            latest_full_entry = full_conversation_history[-1]
-
-                            # Format history and responses for CSV
-                            formatted_history = format_history_for_csv(latest_full_entry.get('history_snapshot', []))
-                            formatted_responses = format_responses_for_csv(latest_full_entry.get('responses', []))
-                            entire_conversation = format_history_for_csv(full_conversation_history)
-
-                            csv_entry = {
-                                'index': len(conversation_history),
-                                'date_time': timestamp,
-                                'prompt': conversation_history[-1]['prompt'],  # Partner prompt
-                                'prompt_for_response': conversation_history[-1]['prompt_for_response'],
-                                'history': formatted_history,
-                                'responses': formatted_responses,
-                                'chosen_response': chosen_response,
-                                'input_type': input_type_flag,
-                                'api_latency': conversation_history[-1]['api_latency'],
-                                'chosen_response_latency': chosen_response_latency,
-                                'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else "",
-                                'full_conversation_history': entire_conversation
-                            }
-                            append_to_csv_file(csv_file_path, csv_entry)
-
-                        elif not conversation_history: # user initiated the conversation by typed utterance or quick fire
-                            
-                            update_history(
-                                conversation_history,
-                                None,
-                                chosen_response,
-                                None,
-                                full_conversation_history,
-                                None,
-                                emotion,
-                                None
-                            )
-
-                            # Update the last conversation pair with user's chosen response
-                            # conversation_history[-1]['user_response'] = chosen_response
-                            update_full_history(full_conversation_history, conversation_history[-1], chosen_response)
-                            timestamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
-
-                            if not full_conversation_history:
-                                logger.error("Full conversation history is empty. Cannot append to CSV.")
-                                await websocket.send_text(json.dumps({'error': 'Conversation history is empty.'}))
-                                websocket_message_sent("/ws")
-                                continue
-                            
-                            latest_full_entry = full_conversation_history[-1]
-
-                            # Format history and responses for CSV
-                            formatted_history = format_history_for_csv(latest_full_entry.get('history_snapshot', []))
-                            # formatted_responses = format_responses_for_csv(latest_full_entry.get('responses', []))
-                            formatted_responses = None
-                            entire_conversation = format_history_for_csv(full_conversation_history)
-
-                            csv_entry = {
-                                'index': len(conversation_history),
-                                'date_time': timestamp,
-                                'prompt': conversation_history[-1]['prompt'],  # Partner prompt
-                                'prompt_for_response': conversation_history[-1]['prompt_for_response'],
-                                'history': formatted_history,
-                                'responses': formatted_responses,
-                                'chosen_response': chosen_response,
-                                'input_type': input_type_flag,
-                                'api_latency': conversation_history[-1]['api_latency'],
-                                'chosen_response_latency': chosen_response_latency,
-                                'full_prompt_to_api': last_full_prompt_to_api if last_full_prompt_to_api else "",
-                                'full_conversation_history': entire_conversation
-                            }
-                            append_to_csv_file(csv_file_path, csv_entry)
-
-                        else:
-                            logger.error("Chosen response received without a corresponding prompt.")
-                            await websocket.send_text(json.dumps({'error': 'No corresponding prompt for chosen response.'}))
-                            websocket_message_sent("/ws")
-                    else:
-                        logger.error("No chosen response found in the received data.")
-                        await websocket.send_text(json.dumps({'error': 'Chosen response is empty.'}))
-                        websocket_message_sent("/ws")
-
-                elif prefix == 'Generate Topic Comment':
-                    
-                    topic_comment = state.get("$socket", "")
-
-                    # Add conversation history to the prompt for context
-                    history_context = format_conversation_history_for_prompt(conversation_history)
-                    final_prompt_to_api = f"{history_context}\nTopic: {topic_comment}\n\nPlease respond accordingly."
-                    # Store it globally so we can use it later when chosen response is picked
-                    last_full_prompt_to_api = final_prompt_to_api
-                    incomplete_message = check_last_entry(conversation_history)
-
-                    try:    
-                        # Send prompt to LightRAG API
-                        api_request_start_time = datetime.now(ET)
-                        response,is_responseOk,error_text = await send_to_api_async(
-                            final_prompt_to_api,
-                            number_of_responses=8,
-                            response_types=["a positive response on the given topic", 
-                                            "a negative response on the given topic", 
-                                            "a positive response on the given topic with more variation", 
-                                            "a negative response on the given topic with more variation",
-                                            "a follow-up question with positive intent on the given topic",
-                                            "a follow-up question with negative intent on the given topic",
-                                            "a follow-up question with positive intent and more response variation on the given topic",
-                                            "a follow-up question with positive intent and more response variation on the given topic"],
-                            search_mode="naive",
-                            generate_topic_response=True
-                        )
-                        api_request_end_time = datetime.now(ET)
-                        api_latency = (api_request_end_time - api_request_start_time).total_seconds()
-
-                        responses_list = response.get('responses', [])
-                    except Exception as e: # adds an extra check to ensure errors apart from httpx errors (low level errors) are handled properly and there is a fall-back for such unexpected situations
-                        logger.error(f"API call failed: {e}", exc_info=True)
-                        is_responseOk = False
-                        error_text = str(e)
-                        responses_list = fallback_response()
-
-                    # Ensure at least 8 responses
-                    while len(responses_list) < 8:
-                        responses_list.append({'response_text': 'No response available.'})
-
-                    # if not partner_prompt: # first utterance by the user
-                    #     partner_prompt = ""
-
-                    # Construct response dictionary
-                    responses_dict = {
-                        'Display': partner_prompt,
-                        'response1': responses_list[0].get('response_text', ''),
-                        'response2': responses_list[1].get('response_text', ''),
-                        'response3': responses_list[2].get('response_text', ''),
-                        'response4': responses_list[3].get('response_text', ''),
-                        'turnaround1': responses_list[4].get('response_text', ''),
-                        'turnaround2': responses_list[5].get('response_text', ''),
-                        'turnaround3': responses_list[6].get('response_text', ''),
-                        'turnaround4': responses_list[7].get('response_text', '')
-                    }
-
-                    # if incomplete_message:
-                    #     responses_dict['warning'] = incomplete_message
-
-                    if not is_responseOk:
-                        responses_dict['error'] = error_text
-
-                    time_responses_sent = datetime.now(ET)
-                    await websocket.send_text(json.dumps(responses_dict))
-                    websocket_message_sent("/ws")
-
-                    # Update conversation histories with partner prompt and no chosen response yet
-                    update_history(
-                        conversation_history,
-                        partner_prompt,
-                        None,
-                        responses_list,
-                        full_conversation_history,
-                        emotion,
-                        api_latency
-                    )
-
-                elif prefix == 'new_conv':
-                    logger.info("Received 'new_conv' prefix, starting a new conversation.")
-                    conversation_history.clear()
-                    full_conversation_history.clear()
-                    last_full_prompt_to_api = None
-                    queue.clear()
-
-                    # Reinitialize CSV file for a new conversation session
-                    csv_file_path = generate_csv_filename()
-                    initialize_csv_file(csv_file_path)
-                    time_responses_sent = None
-                    logger.info(f"New CSV file created at {csv_file_path} for the new conversation.")
-                    await websocket.send_text(json.dumps({'state': {"$Info": "New conversation started."}}))
-                    websocket_message_sent("/ws")
-
-                else:
-                    logger.error(f"Unexpected prefix value: {prefix}")
-                    await websocket.send_text(json.dumps({'error': f"Unexpected prefix value: {prefix}"}))
-                    websocket_message_sent("/ws")
-
-            except json.JSONDecodeError:
-                logger.error("Invalid JSON received.")
-                await websocket.send_text(json.dumps({'error': 'Invalid JSON format.'}))
-                websocket_message_sent("/ws")
-            except Exception as e:
-                logger.error(f"An error occurred while processing the message: {e}")
-                await websocket.send_text(json.dumps({'error': 'Internal server error.'}))
-                websocket_message_sent("/ws")
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected.")
-        websocket_disconnect()
+async def websocket_endpoint(websocket: WebSocket):
+    session = ConversationSession(websocket)
+    SessionManager.set_session(session)
+    await session.run()
 
 # ------------------------ CSV Download Endpoint ------------------------
 
 @app.get("/download_csv")
 async def download_csv():
-    global csv_file_path
-    if csv_file_path and os.path.exists(csv_file_path):
-        logger.info(f"CSV file found at {csv_file_path}. Preparing for download.")
-        return FileResponse(csv_file_path, media_type='text/csv', filename=os.path.basename(csv_file_path))
+    # global csv_file_path
+    session = SessionManager.get_session()
+    if session.csv_file_path and os.path.exists(session.csv_file_path):
+        logger.info(f"CSV file found at {session.csv_file_path}. Preparing for download.")
+        return FileResponse(session.csv_file_path, media_type='text/csv', filename=os.path.basename(session.csv_file_path))
     else:
         logger.error("CSV file does not exist.")
         raise HTTPException(status_code=404, detail="CSV file does not exist.")
@@ -691,20 +600,16 @@ async def metrics_endpoint():
 
 # ------------------------ Root Endpoint ------------------------
 
-# @app.get("/")
-# def read_root():
-#     return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Main Server. Use appropriate endpoints to interact."}
 
 @app.api_route("/receive_transcript", methods=["GET", "POST", "OPTIONS"])
 async def receive_transcript_proxy_temp(request: Request):
-    global queue
-    global response_chosen_flag
-    global last_full_prompt_to_api
-    global time_responses_sent
-    global conversation_history
+    session = SessionManager.get_session()
 
-    api_latency=None
-    # receive_transcript_request_time = datetime.now() #time when the server recieved a request from OS-DPI for transcription
+    if not session:
+        return JSONResponse(content={"status": "error", "error": "No active WebSocket session"}, status_code=400)
 
     if request.method == "OPTIONS":
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -718,116 +623,54 @@ async def receive_transcript_proxy_temp(request: Request):
             source = data.get("source", "asr")
 
             if source == "asr":
-
-                if not queue:
-                    response_chosen_flag = False
+                if not session.queue:
+                    session.response_chosen_flag = False
                     emotion = 'friendly'
-                    partner_prompt,is_final_transcript,time_dG_received = get_transcript(data)
+                    partner_prompt, is_final_transcript, time_dG_received = get_transcript(data)
 
                     if is_final_transcript:
-                        # transcribed_time = datetime.now() #time when server recieved the final transcribed speech from OS-DPI asr.js 
-                        # time_dG_received = datetime.fromtimestamp(time_dG_received / 1000.0) #to convert JS date format to Python date format
-                        # latency_server_to_OS_DPI_transcription_receive_time = (transcribed_time - receive_transcript_request_time).total_seconds()
-                        # latency_OS_DPI_sent_to_server_receive_time = (transcribed_time - time_dG_received).total_seconds()
-
-                        # logger.info(f"latency_server_receive_to_transcribe_time: {latency_server_to_OS_DPI_transcription_receive_time}")
-                        # logger.info(f"latency_OS_DPI_sent_to_server_receive: {latency_OS_DPI_sent_to_server_receive_time}")
-
                         logger.info(f"Partner prompt received: {partner_prompt}")
+                        session.queue.append(partner_prompt)
+                        prompt_for_response = partner_prompt
 
-                        queue.append(partner_prompt)
-                        prompt_for_response = partner_prompt #to capture which partner prompt is used for generating responses in that conversation turn
-                        
-                        # Add conversation history to the prompt for context
-                        history_context = format_conversation_history_for_prompt(conversation_history)
+                        history_context = format_conversation_history_for_prompt(session.conversation_history)
                         final_prompt_to_api = f"{history_context}\nPartner: {partner_prompt}\n\nPlease respond accordingly."
-                        # Store it globally so we can use it later when chosen response is picked
-                        last_full_prompt_to_api = final_prompt_to_api
+                        session.last_full_prompt_to_api = final_prompt_to_api
 
-                        try:
-                            # Send prompt to LightRAG API
-                            api_request_start_time = datetime.now(ET)
-                            response,is_responseOk,error_text = await send_to_api_async(
-                                final_prompt_to_api,
-                                number_of_responses=8,
-                                response_types=["positive", 
-                                                "negative", 
-                                                "positive with more variation in response", 
-                                                "negative with more variation in response",
-                                                "a follow-up question with positive intent",
-                                                "a follow-up question with negative intent",
-                                                "a follow-up question with positive intent and more response variation",
-                                                "a follow-up question with positive intent and more response variation"],
-                                search_mode="naive",
-                                generate_topic_response=False
-                            )
-                            api_request_end_time = datetime.now(ET)
-                            api_latency = (api_request_end_time - api_request_start_time).total_seconds()
+                        responses_list, is_response_ok, error_text, api_latency = await get_responses_from_api(final_prompt_to_api)
 
-                            responses_list = response.get('responses', [])
-
-                        except Exception as e: # adds an extra check to ensure errors apart from httpx errors (low level errors) are handled properly and there is a fall-back for such unexpected situations
-                            logger.error(f"API call failed: {e}", exc_info=True)
-                            is_responseOk = False
-                            error_text = str(e)
-                            responses_list = fallback_response()
-
-                        # Ensure at least 8 responses
                         while len(responses_list) < 8:
                             responses_list.append({'response_text': 'No response available.'})
 
-                        # Construct response dictionary
-                        responses_dict = {
-                            'Display': partner_prompt,
-                            'response1': responses_list[0].get('response_text', ''),
-                            'response2': responses_list[1].get('response_text', ''),
-                            'response3': responses_list[2].get('response_text', ''),
-                            'response4': responses_list[3].get('response_text', ''),
-                            'turnaround1': responses_list[4].get('response_text', ''),
-                            'turnaround2': responses_list[5].get('response_text', ''),
-                            'turnaround3': responses_list[6].get('response_text', ''),
-                            'turnaround4': responses_list[7].get('response_text', '')
-                        }
+                        responses_dict = format_responses_for_ws(partner_prompt, responses_list, error_text if not is_response_ok else None)
 
-                        #if incomplete_message:
-                        #    responses_dict['warning'] = incomplete_message
-                        if not is_responseOk:
-                            responses_dict['error'] = error_text
-
-                        time_responses_sent = datetime.now(ET)
-                        await websocket.send_text(json.dumps(responses_dict))
+                        session.time_responses_sent = datetime.now(ET)
+                        await session.websocket.send_text(json.dumps(responses_dict))
                         websocket_message_sent("/ws")
                         logger.info("Generated responses sent to OS-DPI")
 
-                        # Update conversation histories with partner prompt and no chosen response yet
                         update_history(
-                            conversation_history,
+                            session.conversation_history,
                             partner_prompt,
                             None,
                             responses_list,
-                            full_conversation_history,
+                            session.full_conversation_history,
                             prompt_for_response,
                             emotion,
                             api_latency
                         )
                 else:
-                    if response_chosen_flag == False:
-                        partner_prompt,is_final_transcript,time_dG_received = get_transcript(data)
+                    if not session.response_chosen_flag:
+                        partner_prompt, is_final_transcript, time_dG_received = get_transcript(data)
                         if is_final_transcript:
-                            queue.append(partner_prompt)
-                            # transcribed_time = datetime.now() #time when server recieved the transcribed speech from OS-DPI asr.js 
-                            # time_dG_received = datetime.fromtimestamp(time_dG_received / 1000.0) #to convert JS date format to Python date format
-                            # latency_server_to_OS_DPI_transcription_receive_time = (transcribed_time - receive_transcript_request_time).total_seconds()
-                            # latency_OS_DPI_sent_to_server_receive_time = (transcribed_time - time_dG_received).total_seconds()
-                            # logger.info(f"latency_server_receive_to_transcribe_time: {latency_server_to_OS_DPI_transcription_receive_time}")
-                            # logger.info(f"latency_OS_DPI_sent_to_server_receive: {latency_OS_DPI_sent_to_server_receive_time}")
+                            session.queue.append(partner_prompt)
                             logger.info(f"Partner prompt received: {partner_prompt}")
 
             elif source == "prompt":
                 rows = data.get("rows", [])
                 for row in rows:
-                    key       = row.get("key")
-                    prompt    = row.get("prompt")
+                    key = row.get("key")
+                    prompt = row.get("prompt")
                     timestamp = row.get("timestamp")
                     print(f"[PROMPT] [{timestamp}] {key} → {prompt}")
 
@@ -838,7 +681,7 @@ async def receive_transcript_proxy_temp(request: Request):
 
         except Exception as e:
             logger.error(f"An error occurred while processing the transcript: {e}")
-            await websocket.send_text(json.dumps({'error': str(e)}))
+            await session.websocket.send_text(json.dumps({'error': str(e)}))
             websocket_message_sent("/ws")
             return JSONResponse(content={"status": "error", "error": str(e)}, status_code=400)
 
