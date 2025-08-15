@@ -206,14 +206,15 @@ def append_to_csv_file(path, entry_dict):
     except Exception as e:
         logger.error(f"Failed to append to CSV: {e}")
 
-async def send_to_api_async(prompt, number_of_responses, response_types, search_mode, generate_topic_response):
+async def send_to_api_async(prompt, number_of_responses, response_types, search_mode, generate_topic_response,user_session_prompt):
 
     payload = {
         'prompt': prompt,
         'number_of_responses': number_of_responses,
         'response_types': response_types,
         'search_mode': search_mode,
-        'topic_response': generate_topic_response
+        'topic_response': generate_topic_response,
+        'session_prompt': user_session_prompt
     }
     logger.info(f"Sending payload to API with prompt:\n{prompt}")
 
@@ -249,7 +250,7 @@ async def send_to_api_async(prompt, number_of_responses, response_types, search_
         logger.error(f"Request error: {e}")
         return ({"responses": []}, False, str(e))
 
-async def get_responses_from_api(prompt: str) -> tuple[list[dict], bool, str, float]:
+async def get_responses_from_api(prompt: str,generate_topic_response=False,user_session_prompt=None) -> tuple[list[dict], bool, str, float]:
     try:
         start = datetime.now(ET)
         response, ok, error = await send_to_api_async(
@@ -257,7 +258,8 @@ async def get_responses_from_api(prompt: str) -> tuple[list[dict], bool, str, fl
             number_of_responses=8,
             response_types=RESPONSE_TYPES,
             search_mode="naive",
-            generate_topic_response=False
+            generate_topic_response=generate_topic_response,
+            user_session_prompt=user_session_prompt
         )
         latency = (datetime.now(ET) - start).total_seconds()
         return response.get("responses", []), ok, error, latency
@@ -290,7 +292,7 @@ def format_conversation_history_for_prompt(conversation_history):
             history_str += f"User: {h['user_response']}\n"
     return history_str.strip()
 
-def update_history(history, partner_prompt, user_response, model_responses, full_history, prompt_for_response, emotion, api_latency=0):
+def update_history(history, partner_prompt, user_response, model_responses, full_history, prompt_for_response, emotion, api_latency=0.0):
     if len(history) >= 3:
         removed = history.pop(0)
         logger.debug(f"Removed oldest entry from conversation history: {removed['prompt']}")
@@ -394,6 +396,7 @@ class ConversationSession:
         self.queue = deque()
         self.input_type_flag = None
         self.partner_prompt = ""
+        self.user_session_prompt = ''
 
         initialize_csv_file(self.csv_file_path)
 
@@ -505,8 +508,9 @@ class ConversationSession:
         history_context = format_conversation_history_for_prompt(self.conversation_history)
         final_prompt_to_api = f"{history_context}\nTopic: {topic_comment}\n\nPlease respond accordingly."
         self.last_full_prompt_to_api = final_prompt_to_api
+        generate_topic_response = True
 
-        responses_list, is_response_ok, error_text, api_latency = await get_responses_from_api(final_prompt_to_api)
+        responses_list, is_response_ok, error_text, api_latency = await get_responses_from_api(final_prompt_to_api,generate_topic_response,self.user_session_prompt)
 
         while len(responses_list) < 8:
             responses_list.append({'response_text': 'No response available.'})
@@ -524,6 +528,7 @@ class ConversationSession:
             None,
             responses_list,
             self.full_conversation_history,
+            None,
             emotion,
             api_latency
         )
@@ -537,6 +542,8 @@ class ConversationSession:
         self.csv_file_path = generate_csv_filename()
         initialize_csv_file(self.csv_file_path)
         self.time_responses_sent = None
+        self.user_session_prompt='None'
+
         logger.info(f"New CSV file created at {self.csv_file_path} for the new conversation.")
         await self.websocket.send_text(json.dumps({'state': {"$Info": "New conversation started."}}))
         websocket_message_sent("/ws")
@@ -637,7 +644,7 @@ async def receive_transcript_proxy_temp(request: Request):
                         final_prompt_to_api = f"{history_context}\nPartner: {partner_prompt}\n\nPlease respond accordingly."
                         session.last_full_prompt_to_api = final_prompt_to_api
 
-                        responses_list, is_response_ok, error_text, api_latency = await get_responses_from_api(final_prompt_to_api)
+                        responses_list, is_response_ok, error_text, api_latency = await get_responses_from_api(final_prompt_to_api,False,session.user_session_prompt)
 
                         while len(responses_list) < 8:
                             responses_list.append({'response_text': 'No response available.'})
@@ -670,9 +677,11 @@ async def receive_transcript_proxy_temp(request: Request):
                 rows = data.get("rows", [])
                 for row in rows:
                     key = row.get("key")
-                    prompt = row.get("prompt")
+                    user_session_prompt = row.get("prompt")
                     timestamp = row.get("timestamp")
-                    print(f"[PROMPT] [{timestamp}] {key} → {prompt}")
+                    session.user_session_prompt = user_session_prompt
+                    print(f"[PROMPT] [{timestamp}] {key} → {user_session_prompt}")
+
 
             else:
                 print(f"[WARN] Unknown source: {source!r}")
