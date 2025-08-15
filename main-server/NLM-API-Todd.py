@@ -70,6 +70,9 @@ REQUEST_LATENCY = Histogram(
 class MetricsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         endpoint = request.url.path
+        if endpoint == '/metrics':
+            return await call_next(request)
+        
         method = request.method
         REQUEST_COUNT.labels(endpoint=endpoint, method=method).inc()
         
@@ -145,7 +148,7 @@ async def aquery(query: str, param: QueryParam):
     response = await loop.run_in_executor(None, rag.query, query, param)
     return response
 
-def build_system_prompt(topic_mode: bool) -> str:
+def build_system_prompt(topic_mode: bool,session_prompt='None') -> str:
     base_prompt = (
         "You are Todd Hutchinson, a resilient, warm, and no-nonsense individual who is both friendly and direct. "
         "You communicate concisely and informally, balancing witty humor with empathy and assertiveness. "
@@ -153,7 +156,7 @@ def build_system_prompt(topic_mode: bool) -> str:
         "and maintaining a long-standing career in research. Adapt your style based on your relationship: be playful and supportive with your life partner Sue; "
         "humorous, flirtatious, and light-hearted with your drinking partner Amy; and joking yet direct with your friend/employee Jim, while staying respectful and directive with your staff. "
     )
-
+    
     instruction = (
         "As Todd, generate responses on this topic in a conversational manner keeping in mind my persona described above, "
         if topic_mode else
@@ -171,7 +174,7 @@ def build_system_prompt(topic_mode: bool) -> str:
         "]\n\n"
     )
 
-    return base_prompt + instruction + format_instruction
+    return base_prompt + session_prompt + instruction + format_instruction if session_prompt!='None' else base_prompt + instruction + format_instruction
 
 
 def build_system_query(system_prompt: str, prompt: str, response_types: List[str], number_of_responses: int) -> str:
@@ -208,6 +211,7 @@ class GenerateResponseRequest(BaseModel):
     response_types: List[str] = Field(..., example=["positive", "negative"])
     search_mode: str = Field(..., example="hybrid", description="Options: naive, local, global, hybrid"),
     topic_response: bool = Field(..., example=False,description="Whether to generate topic comment responses")
+    session_prompt: str = Field(...,example="You are Todd")
 
 class GeneratedResponse(BaseModel):
     response_type: str
@@ -261,7 +265,7 @@ async def generate_response_informed(request: GenerateResponseRequest):
         f"search_mode: {request.search_mode}"
     )
 
-    system_prompt = build_system_prompt(request.topic_response)
+    system_prompt = build_system_prompt(request.topic_response,request.session_prompt)
     system_query = build_system_query(
         system_prompt,
         request.prompt,
